@@ -35,7 +35,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   
   const [peerConnected, setPeerConnected] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   
   // --- State: Persistence (LocalStorage) ---
   const [isMuted, setIsMuted] = useState(() => localStorage.getItem('p2p_isMuted') === 'true');
@@ -62,6 +61,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const channel = useRef<any>(null);
   const isInitiator = useRef(false);
   const announceInterval = useRef<any>(null);
+  const negotiationTimeout = useRef<any>(null);
   
   // Media Refs
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -226,17 +226,27 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
 
       try {
         if (payload.type === 'announce') {
-            // Heartbeat received from another peer.
-            if (peerConnection.current.connectionState === 'connected' || 
-                peerConnection.current.signalingState !== 'stable') {
-                return; 
-            }
+            const pcState = peerConnection.current.connectionState;
+            const sigState = peerConnection.current.signalingState;
 
+            // If we are already connected, ignore announcements
+            if (pcState === 'connected') return;
+
+            // Determining Initiator
             if (myId.current > payload.senderId) {
-                console.log("Announcement received. I am Initiator. Calling...");
-                initiateConnection();
+                // I am the "Winner" (Initiator)
+                // If I'm already offering or stable, I might need to re-offer if things are stuck
+                console.log("Announcement received. I am Initiator. Checking state...");
+                
+                if (sigState === 'stable' || pcState === 'failed' || pcState === 'disconnected') {
+                    initiateConnection();
+                } 
+                // If I am already 'have-local-offer', I am already trying to connect. 
+                // But if it's been too long, we might need to reset.
             } else {
+                // I am the "Follower"
                 console.log("Announcement received. I am Follower. Waiting for offer...");
+                // Stop my announce loop so I don't confuse the initiator
                 if (announceInterval.current) {
                     clearInterval(announceInterval.current);
                     announceInterval.current = null;
@@ -253,6 +263,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             announceInterval.current = null;
           }
 
+          // Handle Glare: If I also sent an offer, but I have a lower ID, I must yield.
+          // Since the logic forces high ID to offer, we shouldn't have glare, but rollback just in case.
           if (peerConnection.current.signalingState !== 'stable') {
              await Promise.all([
                 peerConnection.current.setLocalDescription({type: "rollback"}),
@@ -262,6 +274,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
              await peerConnection.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
           }
           
+          // Add queued candidates
           while (iceCandidatesQueue.current.length > 0) {
               const candidate = iceCandidatesQueue.current.shift();
               if (candidate) {
@@ -284,7 +297,10 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           console.log("Received Answer");
           setStatus('Negotiating');
           setStatusMessage('Finalizing connection...');
-          await peerConnection.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          // Only set remote if we are in a state expecting it
+          if (peerConnection.current.signalingState === 'have-local-offer') {
+              await peerConnection.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          }
           
         } else if (payload.type === 'ice-candidate') {
           if (payload.candidate) {
@@ -301,12 +317,17 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         }
       } catch (e) {
         console.error('Signaling error:', e);
+        // If a fatal signaling error occurs, restart
+        if (payload.type === 'offer' || payload.type === 'answer') {
+             restartConnection();
+        }
       }
   };
 
   const initiateConnection = async () => {
       if (!peerConnection.current) return;
       
+      // Clear announcement to prevent flooding
       if (announceInterval.current) {
         clearInterval(announceInterval.current);
         announceInterval.current = null;
@@ -317,6 +338,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       isInitiator.current = true;
 
       try {
+        // Data channel is required for connection to establish if audio/video fails
         peerConnection.current.createDataChannel('keepalive');
 
         const offer = await peerConnection.current.createOffer({
@@ -331,31 +353,48 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             event: 'signal',
             payload: { type: 'offer', sdp: offer, senderId: myId.current },
         });
+
+        // Set a timeout to reset if no answer received
+        if (negotiationTimeout.current) clearTimeout(negotiationTimeout.current);
+        negotiationTimeout.current = setTimeout(() => {
+            if (peerConnection.current?.connectionState !== 'connected') {
+                console.log("Negotiation timed out. Retrying...");
+                restartConnection();
+            }
+        }, 10000);
+
       } catch (e) {
           console.error("Error initiating connection", e);
       }
+  };
+
+  const restartConnection = () => {
+      console.log("Restarting connection...");
+      if (peerConnection.current) {
+          peerConnection.current.close();
+          peerConnection.current = null;
+      }
+      createPeerConnection();
+      if (localStreamRef.current && peerConnection.current) {
+        localStreamRef.current.getTracks().forEach(track => {
+            try {
+                peerConnection.current?.addTrack(track, localStreamRef.current!);
+            } catch(e) { console.error("Error adding initial tracks", e); }
+        });
+      }
+      setStatus('Waiting for Peer');
+      setStatusMessage('Retrying connection...');
+      startAnnouncementLoop();
   };
 
   const handleRemoteDisconnect = () => {
     setStatus('Waiting for Peer');
     setStatusMessage('Peer left. Waiting...');
     setPeerConnected(false);
-    setRemoteStream(null);
+    // Do not clear remote stream immediately if you want to keep last frame, but usually better to clear:
     if(remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     
-    if (peerConnection.current) {
-        peerConnection.current.close();
-        peerConnection.current = null;
-    }
-    createPeerConnection();
-    
-    if (localStreamRef.current && peerConnection.current) {
-        localStreamRef.current.getTracks().forEach(t => 
-            peerConnection.current?.addTrack(t, localStreamRef.current!)
-        );
-    }
-
-    startAnnouncementLoop();
+    restartConnection();
   };
 
   const createPeerConnection = () => {
@@ -371,19 +410,29 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             event: 'signal',
             payload: { type: 'ice-candidate', candidate: event.candidate, senderId: myId.current },
           });
+          setDetailedStatus(prev => ({ ...prev, ice: 'Gathering...' }));
         }
       };
       
       peerConnection.current.ontrack = (event) => {
         console.log("Track received", event.streams[0]);
-        setRemoteStream(event.streams[0]);
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0];
-          // Critical for mobile browsers to actually play the video
-          remoteVideoRef.current.play().catch(e => console.log("Auto-play blocked", e));
+        if (event.streams && event.streams[0]) {
+             if (remoteVideoRef.current) {
+                remoteVideoRef.current.srcObject = event.streams[0];
+                remoteVideoRef.current.play().catch(e => console.log("Auto-play blocked", e));
+             }
+             setPeerConnected(true);
         }
       };
       
+      peerConnection.current.oniceconnectionstatechange = () => {
+          setDetailedStatus(prev => ({ ...prev, ice: peerConnection.current?.iceConnectionState || '-' }));
+      };
+      
+      peerConnection.current.onsignalingstatechange = () => {
+           setDetailedStatus(prev => ({ ...prev, signal: peerConnection.current?.signalingState || '-' }));
+      };
+
       peerConnection.current.onconnectionstatechange = () => {
         const state = peerConnection.current?.connectionState;
         console.log("Connection State Change:", state);
@@ -392,6 +441,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             setStatusMessage('Securely connected');
             setPeerConnected(true);
             if (announceInterval.current) clearInterval(announceInterval.current);
+            if (negotiationTimeout.current) clearTimeout(negotiationTimeout.current);
         } else if (state === 'disconnected') {
             setStatus('Disconnected');
             setStatusMessage('Peer disconnected');
@@ -399,7 +449,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         } else if (state === 'failed') {
             setStatus('Failed');
             setStatusMessage('Connection failed. Retrying...');
-            handleRemoteDisconnect(); 
+            setTimeout(restartConnection, 2000); 
         }
       };
   };
@@ -408,10 +458,12 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       if (announceInterval.current) clearInterval(announceInterval.current);
       
       announceInterval.current = setInterval(() => {
+          // If connection is already happy, stop shouting
           if (peerConnection.current?.connectionState === 'connected') {
               clearInterval(announceInterval.current);
               return;
           }
+          
           console.log("Broadcasting presence...");
           channel.current?.send({
             type: 'broadcast',
@@ -469,6 +521,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
     return () => {
         mounted = false;
         if (announceInterval.current) clearInterval(announceInterval.current);
+        if (negotiationTimeout.current) clearTimeout(negotiationTimeout.current);
         localStreamRef.current?.getTracks().forEach(t => t.stop());
         screenStreamRef.current?.getTracks().forEach(t => t.stop());
         peerConnection.current?.close();
@@ -561,13 +614,9 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         }
       }
 
-      // If we are sharing screen, show it in the local video element
       if (localVideoRef.current) {
           localVideoRef.current.srcObject = screenStream;
       }
-      
-      // If user starts sharing, they probably want to see what they are sharing (or not).
-      // Let's keep the view mode as is, allowing them to swap manually if they want.
       
       setIsScreenSharing(true);
     } catch (err) {
@@ -594,15 +643,14 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       }
   };
 
-  // Helper styles for the swapped view logic
   const fullscreenClasses = "absolute inset-0 w-full h-full object-contain z-0 transition-all duration-300";
-  const pipClasses = "absolute bottom-24 right-4 md:bottom-24 md:left-6 md:right-auto w-32 h-48 md:w-56 md:h-36 bg-black rounded-xl border border-slate-700 z-30 shadow-2xl transition-all duration-300 cursor-pointer hover:border-primary/50 group overflow-hidden";
+  const pipClasses = "absolute bottom-24 right-4 md:bottom-24 md:left-6 md:right-auto w-32 h-48 md:w-56 md:h-36 bg-black rounded-xl border border-slate-700 z-50 shadow-2xl transition-all duration-300 cursor-pointer hover:border-primary/50 group overflow-hidden";
 
   return (
     <div className="flex flex-col w-full bg-background relative overflow-hidden h-[100dvh]">
       
       {/* --- Top Bar --- */}
-      <div className="absolute top-0 left-0 right-0 p-4 z-20 bg-gradient-to-b from-black/90 to-transparent flex justify-between items-start pointer-events-none">
+      <div className="absolute top-0 left-0 right-0 p-4 z-40 bg-gradient-to-b from-black/90 to-transparent flex justify-between items-start pointer-events-none">
         <div className="pointer-events-auto flex items-center gap-3 bg-black/40 backdrop-blur-md px-4 py-2 rounded-full border border-white/10 shadow-lg max-w-[50%]">
             <div className={`w-2.5 h-2.5 rounded-full ${getStatusColor()} shrink-0`} />
             <div className="flex flex-col min-w-0">
@@ -629,11 +677,9 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       <div className="flex-1 flex overflow-hidden relative bg-black">
         
         {/* --- Video Layers --- */}
-        {/* This container handles the visual swapping of videos without unmounting them */}
-        <div className={`w-full h-full relative transition-all duration-300 ${showChat || showSettings ? 'mr-0 md:mr-80' : ''}`}>
+        <div className={`w-full h-full relative transition-all duration-300 ${showChat || showSettings ? 'md:mr-80' : ''}`}>
              
-            {/* 1. REMOTE VIDEO ELEMENT */}
-            {/* Used as Background (Fullscreen) usually, or PiP if swapped */}
+            {/* 1. REMOTE VIDEO */}
             <div 
                 className={isSwapped ? pipClasses : fullscreenClasses}
                 onClick={() => isSwapped && setIsSwapped(false)}
@@ -646,7 +692,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                         className="w-full h-full object-contain bg-black"
                     />
                 ) : (
-                    // Waiting State Visualization (Only visible when remote is fullscreen)
                     !isSwapped && (
                         <div className="w-full h-full flex flex-col items-center justify-center text-slate-500 gap-6 animate-fade-in z-10 relative">
                             <div className="relative">
@@ -672,10 +717,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                         </div>
                     )
                 )}
-                 {/* Label for PiP */}
                 {isSwapped && <div className="absolute bottom-2 left-2 bg-black/60 px-2 py-0.5 rounded text-[10px] text-white backdrop-blur border border-white/10">Remote</div>}
                 
-                {/* Swap Indicator overlay for PiP */}
                 {isSwapped && (
                      <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                          <ArrowLeftRight className="text-white" size={24} />
@@ -683,8 +726,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                 )}
             </div>
 
-            {/* 2. LOCAL VIDEO ELEMENT */}
-            {/* Used as PiP usually, or Fullscreen if swapped */}
+            {/* 2. LOCAL VIDEO */}
             <div 
                 className={!isSwapped ? pipClasses : fullscreenClasses}
                 onClick={() => !isSwapped && setIsSwapped(true)}
@@ -695,7 +737,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                             ref={localVideoRef} 
                             autoPlay 
                             playsInline 
-                            muted // Always muted to prevent echo
+                            muted
                             className={`w-full h-full object-cover bg-slate-900 ${isVideoOff && !isScreenSharing ? 'hidden' : 'block'} ${isScreenSharing ? '' : 'transform -scale-x-100'}`} 
                         />
                         {isVideoOff && !isScreenSharing && (
@@ -708,7 +750,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                             {isScreenSharing ? 'You (Screen)' : 'You'}
                         </div>
                         
-                         {/* Swap Indicator overlay for PiP */}
                         {!isSwapped && (
                             <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                                 <ArrowLeftRight className="text-white" size={24} />
@@ -729,18 +770,21 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
 
         {/* --- Chat Panel --- */}
         <div className={`
-            absolute top-0 right-0 h-full w-full md:w-80 bg-surface/95 backdrop-blur-xl border-l border-white/10 shadow-2xl transition-transform duration-300 z-50 flex flex-col
+            fixed inset-0 z-[60] bg-surface/95 backdrop-blur-xl transition-transform duration-300 flex flex-col
+            md:absolute md:top-0 md:right-0 md:h-full md:w-80 md:border-l md:border-white/10 md:shadow-2xl
             ${showChat ? 'translate-x-0' : 'translate-x-full'}
         `}>
-            <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20">
+            {/* Header */}
+            <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 pt-safe">
                 <h3 className="font-bold text-white flex items-center gap-2">
                     <MessageSquare size={18} /> Chat
                 </h3>
-                <button onClick={() => setShowChat(false)} className="p-1 hover:bg-white/10 rounded-full transition-colors text-slate-400 hover:text-white">
+                <button onClick={() => setShowChat(false)} className="p-2 hover:bg-white/10 rounded-full transition-colors text-slate-400 hover:text-white">
                     <X size={20} />
                 </button>
             </div>
             
+            {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-black/40">
                 {messages.length === 0 && (
                     <div className="text-center text-slate-500 text-sm mt-10">
@@ -767,21 +811,22 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                 <div ref={chatEndRef} />
             </div>
 
-            <form onSubmit={handleSendMessage} className="p-4 bg-black/20 border-t border-white/10 pb-safe">
+            {/* Input */}
+            <form onSubmit={handleSendMessage} className="p-4 bg-black/20 border-t border-white/10 pb-safe mb-safe">
                 <div className="relative">
                     <input
                         type="text"
                         value={inputMessage}
                         onChange={(e) => setInputMessage(e.target.value)}
                         placeholder="Type a message..."
-                        className="w-full bg-slate-800/50 border border-slate-700 rounded-full pl-4 pr-12 py-2.5 text-sm text-white focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary placeholder:text-slate-500"
+                        className="w-full bg-slate-800/50 border border-slate-700 rounded-full pl-4 pr-12 py-3 text-sm text-white focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary placeholder:text-slate-500"
                     />
                     <button 
                         type="submit" 
                         disabled={!inputMessage.trim()}
-                        className="absolute right-1 top-1 p-1.5 bg-primary text-white rounded-full disabled:opacity-50 disabled:bg-slate-700 transition-all hover:bg-blue-600"
+                        className="absolute right-1.5 top-1.5 p-1.5 bg-primary text-white rounded-full disabled:opacity-50 disabled:bg-slate-700 transition-all hover:bg-blue-600"
                     >
-                        <Send size={16} />
+                        <Send size={18} />
                     </button>
                 </div>
             </form>
@@ -789,19 +834,20 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
 
         {/* --- Settings Panel --- */}
         <div className={`
-            absolute top-0 right-0 h-full w-full md:w-80 bg-surface/95 backdrop-blur-xl border-l border-white/10 shadow-2xl transition-transform duration-300 z-50 flex flex-col
+            fixed inset-0 z-[60] bg-surface/95 backdrop-blur-xl transition-transform duration-300 flex flex-col
+            md:absolute md:top-0 md:right-0 md:h-full md:w-80 md:border-l md:border-white/10 md:shadow-2xl
             ${showSettings ? 'translate-x-0' : 'translate-x-full'}
         `}>
-             <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20">
+             <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 pt-safe">
                 <h3 className="font-bold text-white flex items-center gap-2">
                     <Settings size={18} /> Settings
                 </h3>
-                <button onClick={() => setShowSettings(false)} className="p-1 hover:bg-white/10 rounded-full transition-colors text-slate-400 hover:text-white">
+                <button onClick={() => setShowSettings(false)} className="p-2 hover:bg-white/10 rounded-full transition-colors text-slate-400 hover:text-white">
                     <X size={20} />
                 </button>
             </div>
             
-            <div className="p-6 space-y-8 overflow-y-auto pb-safe">
+            <div className="p-6 space-y-8 overflow-y-auto pb-safe flex-1">
                 {/* Video Quality Section */}
                 <div>
                     <h4 className="text-sm font-semibold text-slate-300 mb-3 flex items-center gap-2">
@@ -851,19 +897,22 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                             <span className="text-slate-500">Signaling</span>
                             <span className="text-slate-300 capitalize">{detailedStatus.signal}</span>
                         </div>
-                        <div className="flex justify-between">
-                            <span className="text-slate-500">Gathering</span>
-                            <span className="text-slate-300 capitalize">{detailedStatus.gathering}</span>
-                        </div>
                         <div className="flex justify-between pt-2 border-t border-white/10">
                             <span className="text-slate-500">Protocol</span>
                             <span className="text-slate-300">WebRTC (P2P)</span>
                         </div>
-                        <div className="flex justify-between">
-                             <span className="text-slate-500">Role</span>
-                             <span className="text-slate-300">{isInitiator.current ? 'Initiator' : 'Peer'}</span>
+                         <div className="flex justify-between">
+                             <span className="text-slate-500">Room ID</span>
+                             <span className="text-slate-300">{roomId}</span>
                         </div>
                     </div>
+                    
+                    <button 
+                        onClick={() => restartConnection()}
+                        className="mt-4 w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs flex items-center justify-center gap-2 transition-colors"
+                    >
+                        <RefreshCw size={12} /> Force Reconnect
+                    </button>
                 </div>
             </div>
         </div>
@@ -871,7 +920,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
 
       {/* --- Screen Share Modal --- */}
       {showShareModal && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="absolute inset-0 z-[70] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-fade-in">
               <div className="bg-surface border border-slate-700 p-6 rounded-2xl w-full max-w-md shadow-2xl">
                   <h3 className="text-xl font-bold text-white mb-2">Share your screen</h3>
                   <p className="text-slate-400 text-sm mb-6">Choose what you want to share with the room.</p>

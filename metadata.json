@@ -1,5 +1,5 @@
 {
-  "name": "Copy of P2P Connect",
+  "name": "P2P App",
   "description": "A serverless, peer-to-peer screen sharing and voice chat application using WebRTC and Supabase for signaling.",
   "requestFramePermissions": [
     "camera",
