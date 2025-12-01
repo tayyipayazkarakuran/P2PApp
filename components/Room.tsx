@@ -209,6 +209,9 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const handleSignalMessage = async (payload: any) => {
       // Don't process our own messages
       if (payload.senderId === myId.current) return;
+      
+      // Console log to debug signal reception
+      // console.log("Received Signal:", payload.type, "From:", payload.senderId);
 
       // --- Chat Messages (Independent of WebRTC status) ---
       if (payload.type === 'chat' && payload.chatMessage) {
@@ -229,28 +232,26 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             const pcState = peerConnection.current.connectionState;
             const sigState = peerConnection.current.signalingState;
 
-            // If we are already connected, ignore announcements
+            // If we are already securely connected, ignore announcements
             if (pcState === 'connected') return;
 
             // Determining Initiator
             if (myId.current > payload.senderId) {
                 // I am the "Winner" (Initiator)
-                // If I'm already offering or stable, I might need to re-offer if things are stuck
-                console.log("Announcement received. I am Initiator. Checking state...");
-                
-                if (sigState === 'stable' || pcState === 'failed' || pcState === 'disconnected') {
-                    initiateConnection();
-                } 
-                // If I am already 'have-local-offer', I am already trying to connect. 
-                // But if it's been too long, we might need to reset.
+                // If I'm already offering/connecting, don't restart process unless failed
+                if (sigState !== 'stable' && pcState !== 'failed' && pcState !== 'disconnected') {
+                    // console.log("Ignoring announce, already negotiating...");
+                    return;
+                }
+
+                console.log("Announcement received. I am Initiator. Calling peer...");
+                initiateConnection();
             } else {
                 // I am the "Follower"
                 console.log("Announcement received. I am Follower. Waiting for offer...");
-                // Stop my announce loop so I don't confuse the initiator
-                if (announceInterval.current) {
-                    clearInterval(announceInterval.current);
-                    announceInterval.current = null;
-                }
+                // IMPORTANT FIX: Do NOT stop announcing yet. 
+                // We keep announcing until we receive an OFFER.
+                // This ensures if the Initiator fails to send offer, they will hear us again.
             }
         } 
         else if (payload.type === 'offer') {
@@ -258,13 +259,13 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           setStatus('Negotiating');
           setStatusMessage('Accepting connection...');
           
+          // NOW we stop announcing, because we have a handshake
           if (announceInterval.current) {
             clearInterval(announceInterval.current);
             announceInterval.current = null;
           }
 
           // Handle Glare: If I also sent an offer, but I have a lower ID, I must yield.
-          // Since the logic forces high ID to offer, we shouldn't have glare, but rollback just in case.
           if (peerConnection.current.signalingState !== 'stable') {
              await Promise.all([
                 peerConnection.current.setLocalDescription({type: "rollback"}),
@@ -327,7 +328,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const initiateConnection = async () => {
       if (!peerConnection.current) return;
       
-      // Clear announcement to prevent flooding
+      // Stop announcing once we decide to call
       if (announceInterval.current) {
         clearInterval(announceInterval.current);
         announceInterval.current = null;
@@ -357,7 +358,10 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         // Set a timeout to reset if no answer received
         if (negotiationTimeout.current) clearTimeout(negotiationTimeout.current);
         negotiationTimeout.current = setTimeout(() => {
-            if (peerConnection.current?.connectionState !== 'connected') {
+            const pcState = peerConnection.current?.connectionState;
+            const iceState = peerConnection.current?.iceConnectionState;
+            
+            if (pcState !== 'connected' && iceState !== 'connected') {
                 console.log("Negotiation timed out. Retrying...");
                 restartConnection();
             }
@@ -391,9 +395,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
     setStatus('Waiting for Peer');
     setStatusMessage('Peer left. Waiting...');
     setPeerConnected(false);
-    // Do not clear remote stream immediately if you want to keep last frame, but usually better to clear:
     if(remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-    
     restartConnection();
   };
 
@@ -440,6 +442,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             setStatus('Connected');
             setStatusMessage('Securely connected');
             setPeerConnected(true);
+            // Ensure announcement loop is killed upon success
             if (announceInterval.current) clearInterval(announceInterval.current);
             if (negotiationTimeout.current) clearTimeout(negotiationTimeout.current);
         } else if (state === 'disconnected') {
@@ -457,8 +460,19 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const startAnnouncementLoop = () => {
       if (announceInterval.current) clearInterval(announceInterval.current);
       
+      // Initial broadcast
+      setTimeout(() => {
+          if (peerConnection.current?.connectionState !== 'connected') {
+             console.log("Broadcasting presence...");
+             channel.current?.send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: { type: 'announce', senderId: myId.current },
+             }).catch((e: any) => console.log("Broadcast failed", e));
+          }
+      }, 500);
+
       announceInterval.current = setInterval(() => {
-          // If connection is already happy, stop shouting
           if (peerConnection.current?.connectionState === 'connected') {
               clearInterval(announceInterval.current);
               return;
@@ -469,7 +483,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             type: 'broadcast',
             event: 'signal',
             payload: { type: 'announce', senderId: myId.current },
-          });
+          }).catch((e: any) => console.log("Broadcast failed", e));
       }, 2000);
   };
 
@@ -512,6 +526,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                 setStatusMessage('Searching for peer...');
                 startAnnouncementLoop();
             }
+          } else {
+             console.log("Supabase Channel Status:", status);
           }
         });
     };
@@ -531,8 +547,9 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                 type: 'broadcast',
                 event: 'signal',
                 payload: { type: 'leave', senderId: myId.current },
-            });
+            }).catch(() => {});
             channel.current.unsubscribe();
+            channel.current = null;
         }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -770,8 +787,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
 
         {/* --- Chat Panel --- */}
         <div className={`
-            fixed inset-0 z-[60] bg-surface/95 backdrop-blur-xl transition-transform duration-300 flex flex-col
-            md:absolute md:top-0 md:right-0 md:h-full md:w-80 md:border-l md:border-white/10 md:shadow-2xl
+            fixed right-0 top-0 h-full w-full md:w-80 z-[60] bg-surface/95 backdrop-blur-xl border-l border-white/10 shadow-2xl transition-transform duration-300 flex flex-col
             ${showChat ? 'translate-x-0' : 'translate-x-full'}
         `}>
             {/* Header */}
@@ -834,8 +850,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
 
         {/* --- Settings Panel --- */}
         <div className={`
-            fixed inset-0 z-[60] bg-surface/95 backdrop-blur-xl transition-transform duration-300 flex flex-col
-            md:absolute md:top-0 md:right-0 md:h-full md:w-80 md:border-l md:border-white/10 md:shadow-2xl
+            fixed right-0 top-0 h-full w-full md:w-80 z-[60] bg-surface/95 backdrop-blur-xl border-l border-white/10 shadow-2xl transition-transform duration-300 flex flex-col
             ${showSettings ? 'translate-x-0' : 'translate-x-full'}
         `}>
              <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/20 pt-safe">
@@ -847,7 +862,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                 </button>
             </div>
             
-            <div className="p-6 space-y-8 overflow-y-auto pb-safe flex-1">
+            <div className="p-6 space-y-8 overflow-y-auto pb-safe flex-1 bg-gradient-to-b from-surface/50 to-black/20">
                 {/* Video Quality Section */}
                 <div>
                     <h4 className="text-sm font-semibold text-slate-300 mb-3 flex items-center gap-2">
