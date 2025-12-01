@@ -210,9 +210,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       // Don't process our own messages
       if (payload.senderId === myId.current) return;
       
-      // Console log to debug signal reception
-      // console.log("Received Signal:", payload.type, "From:", payload.senderId);
-
       // --- Chat Messages (Independent of WebRTC status) ---
       if (payload.type === 'chat' && payload.chatMessage) {
         setMessages(prev => {
@@ -238,20 +235,14 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             // Determining Initiator
             if (myId.current > payload.senderId) {
                 // I am the "Winner" (Initiator)
-                // If I'm already offering/connecting, don't restart process unless failed
                 if (sigState !== 'stable' && pcState !== 'failed' && pcState !== 'disconnected') {
-                    // console.log("Ignoring announce, already negotiating...");
                     return;
                 }
-
                 console.log("Announcement received. I am Initiator. Calling peer...");
                 initiateConnection();
             } else {
                 // I am the "Follower"
                 console.log("Announcement received. I am Follower. Waiting for offer...");
-                // IMPORTANT FIX: Do NOT stop announcing yet. 
-                // We keep announcing until we receive an OFFER.
-                // This ensures if the Initiator fails to send offer, they will hear us again.
             }
         } 
         else if (payload.type === 'offer') {
@@ -259,13 +250,11 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           setStatus('Negotiating');
           setStatusMessage('Accepting connection...');
           
-          // NOW we stop announcing, because we have a handshake
           if (announceInterval.current) {
             clearInterval(announceInterval.current);
             announceInterval.current = null;
           }
 
-          // Handle Glare: If I also sent an offer, but I have a lower ID, I must yield.
           if (peerConnection.current.signalingState !== 'stable') {
              await Promise.all([
                 peerConnection.current.setLocalDescription({type: "rollback"}),
@@ -298,7 +287,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           console.log("Received Answer");
           setStatus('Negotiating');
           setStatusMessage('Finalizing connection...');
-          // Only set remote if we are in a state expecting it
           if (peerConnection.current.signalingState === 'have-local-offer') {
               await peerConnection.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
           }
@@ -318,7 +306,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         }
       } catch (e) {
         console.error('Signaling error:', e);
-        // If a fatal signaling error occurs, restart
         if (payload.type === 'offer' || payload.type === 'answer') {
              restartConnection();
         }
@@ -328,7 +315,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const initiateConnection = async () => {
       if (!peerConnection.current) return;
       
-      // Stop announcing once we decide to call
       if (announceInterval.current) {
         clearInterval(announceInterval.current);
         announceInterval.current = null;
@@ -339,7 +325,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       isInitiator.current = true;
 
       try {
-        // Data channel is required for connection to establish if audio/video fails
+        // Only create if we don't have one (though multiple is safe)
+        // Creating logic handled by PC, this ensures we have at least one channel for setup
         peerConnection.current.createDataChannel('keepalive');
 
         const offer = await peerConnection.current.createOffer({
@@ -361,6 +348,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             const pcState = peerConnection.current?.connectionState;
             const iceState = peerConnection.current?.iceConnectionState;
             
+            // Only restart if we are truly stuck (not connected)
             if (pcState !== 'connected' && iceState !== 'connected') {
                 console.log("Negotiation timed out. Retrying...");
                 restartConnection();
@@ -405,6 +393,15 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       console.log("Creating RTCPeerConnection");
       peerConnection.current = new RTCPeerConnection(ICE_SERVERS);
       
+      // --- Renegotiation Logic ---
+      peerConnection.current.onnegotiationneeded = () => {
+          // Only trigger if we are in a stable state to avoid conflict loops
+          if (peerConnection.current?.signalingState === 'stable') {
+              console.log("Negotiation needed (track change). Sending new offer...");
+              initiateConnection();
+          }
+      };
+
       peerConnection.current.onicecandidate = (event) => {
         if (event.candidate) {
           channel.current?.send({
@@ -417,11 +414,12 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       };
       
       peerConnection.current.ontrack = (event) => {
-        console.log("Track received", event.streams[0]);
+        console.log("Track received", event.track.kind, event.streams[0]);
         if (event.streams && event.streams[0]) {
              if (remoteVideoRef.current) {
                 remoteVideoRef.current.srcObject = event.streams[0];
-                remoteVideoRef.current.play().catch(e => console.log("Auto-play blocked", e));
+                // Force play to ensure mobile/audio-only starts aren't blocked
+                remoteVideoRef.current.play().catch(e => console.log("Auto-play blocked/pending", e));
              }
              setPeerConnected(true);
         }
@@ -442,7 +440,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             setStatus('Connected');
             setStatusMessage('Securely connected');
             setPeerConnected(true);
-            // Ensure announcement loop is killed upon success
             if (announceInterval.current) clearInterval(announceInterval.current);
             if (negotiationTimeout.current) clearTimeout(negotiationTimeout.current);
         } else if (state === 'disconnected') {
@@ -460,7 +457,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const startAnnouncementLoop = () => {
       if (announceInterval.current) clearInterval(announceInterval.current);
       
-      // Initial broadcast
       setTimeout(() => {
           if (peerConnection.current?.connectionState !== 'connected') {
              console.log("Broadcasting presence...");
@@ -576,15 +572,23 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           screenStreamRef.current = null;
       }
 
-      if (peerConnection.current && localStreamRef.current) {
+      if (peerConnection.current) {
           const senders = peerConnection.current.getSenders();
           const videoSender = senders.find(s => s.track?.kind === 'video');
-          const cameraTrack = localStreamRef.current.getVideoTracks()[0];
+          const cameraTrack = localStreamRef.current?.getVideoTracks()[0];
           
-          if (videoSender && cameraTrack) {
-              videoSender.replaceTrack(cameraTrack);
-              cameraTrack.enabled = !isVideoOff;
-              applyVideoQuality(videoQuality); 
+          if (videoSender) {
+              if (cameraTrack) {
+                  // We have a camera to go back to
+                  videoSender.replaceTrack(cameraTrack);
+                  cameraTrack.enabled = !isVideoOff;
+                  applyVideoQuality(videoQuality); 
+              } else {
+                  // We are on an audio-only device. 
+                  // We MUST remove the track to stop sending black/frozen frames.
+                  // This will trigger onnegotiationneeded -> sends new offer without video.
+                  peerConnection.current.removeTrack(videoSender);
+              }
           }
       }
 
@@ -604,7 +608,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
     }
 
     try {
-      // @ts-ignore: displaySurface is a valid constraint in modern browsers
+      // @ts-ignore: displaySurface is a valid constraint
       const constraints: MediaStreamConstraints = {
           video: {
               displaySurface: displaySurface || undefined
@@ -625,8 +629,11 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         const videoSender = senders.find(s => s.track?.kind === 'video');
         
         if (videoSender) {
+            // Use existing video track
             await videoSender.replaceTrack(screenTrack);
         } else {
+            // No video sender (Audio Only Mode was active)
+            // Add new track -> Triggers onnegotiationneeded -> renegotiates connection to include video
             peerConnection.current.addTrack(screenTrack, screenStream);
         }
       }
@@ -774,11 +781,12 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                         )}
                     </>
                 ) : (
-                    <div className="w-full h-full flex flex-col items-center justify-center bg-red-900/20 text-red-400 p-2 text-center">
+                    <div className="w-full h-full flex flex-col items-center justify-center bg-red-900/20 text-red-400 p-2 text-center border border-red-500/30 rounded-xl">
                         <AlertCircle size={24} className="mb-2" />
-                        <span className="text-[10px] leading-tight mb-2">{mediaError}</span>
+                        <span className="text-[10px] leading-tight mb-2 font-bold">Audio Only Mode</span>
+                        <span className="text-[10px] leading-tight mb-2 opacity-70">{mediaError}</span>
                         <button onClick={(e) => { e.stopPropagation(); startMedia(); }} className="text-[10px] bg-red-500/20 hover:bg-red-500/40 px-2 py-1 rounded text-white transition-colors">
-                            Retry
+                            Retry Camera
                         </button>
                     </div>
                 )}
