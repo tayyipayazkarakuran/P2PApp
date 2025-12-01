@@ -36,6 +36,9 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const [peerConnected, setPeerConnected] = useState(false);
   const [mediaError, setMediaError] = useState<string | null>(null);
   
+  // New State for streams to handle React render cycles robustly
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  
   // --- State: Persistence (LocalStorage) ---
   const [isMuted, setIsMuted] = useState(() => localStorage.getItem('p2p_isMuted') === 'true');
   const [isVideoOff, setIsVideoOff] = useState(() => localStorage.getItem('p2p_isVideoOff') === 'true');
@@ -108,6 +111,19 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
     return () => document.removeEventListener('fullscreenchange', handleFullScreenChange);
   }, []);
 
+  // --- VIDEO BINDING EFFECT ---
+  // This ensures the video element gets the stream even if the component re-renders
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream) {
+        // Only assign if different to prevent blinking/resetting
+        if (remoteVideoRef.current.srcObject !== remoteStream) {
+            console.log("Binding remote stream to video element");
+            remoteVideoRef.current.srcObject = remoteStream;
+            remoteVideoRef.current.play().catch(e => console.error("Remote play failed", e));
+        }
+    }
+  }, [remoteStream, peerConnected]);
+
   // --- Video Quality Helper ---
   const applyVideoQuality = async (quality: VideoQuality) => {
     setVideoQuality(quality);
@@ -176,6 +192,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           stream.getVideoTracks().forEach(track => track.enabled = !isVideoOff);
       }
 
+      // Safe bind for local video
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
         localVideoRef.current.muted = true; // Always mute local video to avoid echo
@@ -256,8 +273,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             const pcState = peerConnection.current.connectionState;
             const sigState = peerConnection.current.signalingState;
 
-            // If we are already securely connected, ignore announcements
-            if (pcState === 'connected') return;
+            // If we are already securely connected, ignore announcements completely
+            if (pcState === 'connected' || pcState === 'connecting') return;
 
             // Determining Initiator
             if (myId.current > payload.senderId) {
@@ -393,6 +410,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           peerConnection.current.close();
           peerConnection.current = null;
       }
+      setRemoteStream(null);
       createPeerConnection();
       if (localStreamRef.current && peerConnection.current) {
         localStreamRef.current.getTracks().forEach(track => {
@@ -410,6 +428,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
     setStatus('Waiting for Peer');
     setStatusMessage('Peer left. Waiting...');
     setPeerConnected(false);
+    setRemoteStream(null);
     if(remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     restartConnection();
   };
@@ -443,21 +462,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       peerConnection.current.ontrack = (event) => {
         console.log("Track received", event.track.kind, event.streams[0]);
         if (event.streams && event.streams[0]) {
-             if (remoteVideoRef.current) {
-                // CRITICAL: Prevent resetting srcObject if it's the same stream
-                // This prevents "The play() request was interrupted" AbortErrors
-                if (remoteVideoRef.current.srcObject !== event.streams[0]) {
-                    remoteVideoRef.current.srcObject = event.streams[0];
-                    // Force play to ensure mobile/audio-only starts aren't blocked
-                    remoteVideoRef.current.play().catch(e => {
-                        if (e.name === 'AbortError') {
-                            // Ignore abort errors caused by rapid stream updates
-                        } else {
-                            console.log("Auto-play blocked/pending", e);
-                        }
-                    });
-                }
-             }
+             // Store in state to ensure re-renders don't lose the stream
+             setRemoteStream(event.streams[0]);
              setPeerConnected(true);
         }
       };
