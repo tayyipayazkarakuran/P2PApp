@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { 
   Mic, MicOff, PhoneOff, Video, VideoOff, 
-  Copy, Check, Link as LinkIcon, MessageSquare, Send, X, AlertCircle, RefreshCw, Settings, Signal, Activity, Layers, ArrowLeftRight, Maximize, Minimize, Monitor
+  Copy, Check, Link as LinkIcon, MessageSquare, Send, X, AlertCircle, RefreshCw, Settings, Signal, Activity, Layers, ArrowLeftRight, Maximize, Minimize, Monitor, Film, Zap
 } from 'lucide-react';
 import { getSupabase } from '../services/supabaseClient';
 import { UserConfig, ChatMessage } from '../types';
@@ -24,7 +24,8 @@ const ICE_SERVERS = {
 };
 
 type ConnectionStatus = 'Initializing' | 'Waiting for Peer' | 'Negotiating' | 'Connected' | 'Reconnecting' | 'Disconnected' | 'Failed';
-type VideoQuality = 'low' | 'standard' | 'hd';
+type VideoQuality = 'low' | 'standard' | 'hd' | 'fhd' | '2k';
+type FrameRate = 30 | 60;
 type ScreenShareType = 'monitor' | 'window' | 'browser';
 
 export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
@@ -42,7 +43,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   // --- State: Persistence (LocalStorage) ---
   const [isMuted, setIsMuted] = useState(() => localStorage.getItem('p2p_isMuted') === 'true');
   const [isVideoOff, setIsVideoOff] = useState(() => localStorage.getItem('p2p_isVideoOff') === 'true');
-  const [videoQuality, setVideoQuality] = useState<VideoQuality>('standard');
+  const [videoQuality, setVideoQuality] = useState<VideoQuality>('hd');
+  const [frameRate, setFrameRate] = useState<FrameRate>(30);
   
   // --- State: UI & Chat ---
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -125,27 +127,50 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   }, [remoteStream, peerConnected]);
 
   // --- Video Quality Helper ---
-  const applyVideoQuality = async (quality: VideoQuality) => {
+  const applyVideoQuality = async (quality: VideoQuality, fps: FrameRate) => {
     setVideoQuality(quality);
-    if (!localStreamRef.current || isScreenSharing) return;
+    setFrameRate(fps);
 
-    const videoTrack = localStreamRef.current.getVideoTracks()[0];
+    if (!localStreamRef.current && !screenStreamRef.current) return;
+
+    // Apply to whichever stream is active (Screen share takes priority for these settings if active)
+    const activeStream = isScreenSharing ? screenStreamRef.current : localStreamRef.current;
+    if (!activeStream) return;
+
+    const videoTrack = activeStream.getVideoTracks()[0];
     if (!videoTrack) return;
 
+    // For screen sharing, we set content hint for motion if FPS is high
+    if (isScreenSharing && 'contentHint' in videoTrack) {
+        // @ts-ignore
+        videoTrack.contentHint = 'motion';
+    }
+
     let constraints: MediaTrackConstraints = {};
+    
+    // FPS Constraints
+    const fpsConstraints = { ideal: fps, max: fps };
+
     switch (quality) {
         case 'low':
-            constraints = { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15 } };
+            constraints = { width: { ideal: 320, max: 480 }, height: { ideal: 240, max: 360 }, frameRate: fpsConstraints };
             break;
         case 'standard':
-            constraints = { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } };
+            constraints = { width: { ideal: 640, max: 800 }, height: { ideal: 480, max: 600 }, frameRate: fpsConstraints };
             break;
         case 'hd':
-            constraints = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+            constraints = { width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 }, frameRate: fpsConstraints };
+            break;
+        case 'fhd':
+            constraints = { width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 }, frameRate: fpsConstraints };
+            break;
+        case '2k':
+            constraints = { width: { ideal: 2560, max: 2560 }, height: { ideal: 1440, max: 1440 }, frameRate: fpsConstraints };
             break;
     }
 
     try {
+        console.log(`Applying constraints: Quality=${quality}, FPS=${fps}`);
         await videoTrack.applyConstraints(constraints);
     } catch (err) {
         console.warn("Could not apply video constraints:", err);
@@ -175,8 +200,16 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({ 
-            video: { width: { ideal: 640 }, height: { ideal: 480 } }, // Default standard
-            audio: true 
+            video: { 
+                width: { ideal: 1280 }, 
+                height: { ideal: 720 },
+                frameRate: { ideal: 30 }
+            }, 
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            } 
         });
       } catch (err) {
         console.warn("Video access failed, trying audio only...", err);
@@ -273,33 +306,22 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             const pcState = peerConnection.current.connectionState;
             
             // F5/Refresh Handling:
-            // If we receive an 'announce', it means someone is joining or reconnecting (fresh start).
-            // Even if we think we are 'connected', this announce implies the other peer is NOT connected to us (they are new/refreshed).
-            // We must respect their need to connect.
-            
             console.log("Announcement received from", payload.senderId);
 
             // Determining Initiator based on ID string comparison
             if (myId.current > payload.senderId) {
-                // I am the "Winner" (Initiator).
-                // Regardless of my current state, I must offer to the new peer.
-                // If I was connected to an old session, that session is dead now.
                 console.log("I am Initiator. Starting connection...");
                 
                 // If connected, we should restart to ensure a clean slate for the new peer
                 if (pcState === 'connected' || pcState === 'connecting') {
                      console.log("Was connected, but peer refreshed. Restarting...");
                      restartConnection();
-                     // restartConnection is async in effect, but we need to initiate after it sets up
                      setTimeout(() => initiateConnection(), 100);
                 } else {
                      initiateConnection();
                 }
             } else {
-                // I am the "Follower".
                 console.log("I am Follower. Waiting for offer...");
-                // If I was connected, I should probably prepare to accept a new offer.
-                // Restarting ensures I don't mix old ICE candidates with new ones.
                  if (pcState === 'connected' || pcState === 'connecting') {
                      console.log("Was connected, but peer refreshed. Resetting to wait...");
                      restartConnection();
@@ -317,7 +339,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           }
 
           if (peerConnection.current.signalingState !== 'stable') {
-             // Rollback if we were in the middle of something else to avoid state errors
              await Promise.all([
                 peerConnection.current.setLocalDescription({type: "rollback"}),
                 peerConnection.current.setRemoteDescription(new RTCSessionDescription(payload.sdp))
@@ -401,8 +422,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       isInitiator.current = true;
 
       try {
-        // Only create if we don't have one (though multiple is safe)
-        // Creating logic handled by PC, this ensures we have at least one channel for setup
         peerConnection.current.createDataChannel('keepalive');
 
         const offer = await peerConnection.current.createOffer({
@@ -424,7 +443,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             const pcState = peerConnection.current?.connectionState;
             const iceState = peerConnection.current?.iceConnectionState;
             
-            // Only restart if we are in a stuck state (not connected)
             if (pcState !== 'connected' && iceState !== 'connected') {
                 console.log("Negotiation timed out. Retrying...");
                 restartConnection();
@@ -510,7 +528,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           setDetailedStatus(prev => ({ ...prev, ice: peerConnection.current?.iceConnectionState || '-' }));
           const iceState = peerConnection.current?.iceConnectionState;
           if (iceState === 'connected' || iceState === 'completed') {
-             // Sometimes onconnectionstatechange doesn't fire for 'connected', so we trust ICE too
              if (status !== 'Connected') {
                  setStatus('Connected');
                  setStatusMessage('Securely connected');
@@ -560,7 +577,6 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       }, 500);
 
       announceInterval.current = setInterval(() => {
-          // If we are connected, stop announcing
           if (peerConnection.current?.connectionState === 'connected') {
               clearInterval(announceInterval.current);
               announceInterval.current = null;
@@ -675,11 +691,10 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                   // We have a camera to go back to
                   videoSender.replaceTrack(cameraTrack);
                   cameraTrack.enabled = !isVideoOff;
-                  applyVideoQuality(videoQuality); 
+                  // Re-apply settings to camera
+                  applyVideoQuality(videoQuality, frameRate); 
               } else {
                   // We are on an audio-only device. 
-                  // We MUST remove the track to stop sending black/frozen frames.
-                  // This will trigger onnegotiationneeded -> sends new offer without video.
                   peerConnection.current.removeTrack(videoSender);
               }
           }
@@ -704,14 +719,28 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       // @ts-ignore: displaySurface is a valid constraint
       const constraints: MediaStreamConstraints = {
           video: {
-              displaySurface: displaySurface || undefined
+              displaySurface: displaySurface || undefined,
+              frameRate: { ideal: frameRate, max: 60 },
           },
-          audio: true // Request system audio
+          audio: {
+            // CRITICAL: Disable echo cancellation for high quality system audio
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 2, // Stereo
+            sampleRate: 48000
+          }
       };
 
       const screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
       screenStreamRef.current = screenStream;
       const screenTrack = screenStream.getVideoTracks()[0];
+      
+      // Optimize for Motion (Movies/Games)
+      if ('contentHint' in screenTrack) {
+          // @ts-ignore
+          screenTrack.contentHint = 'motion';
+      }
 
       screenTrack.onended = () => {
           stopScreenShare();
@@ -722,11 +751,8 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         const videoSender = senders.find(s => s.track?.kind === 'video');
         
         if (videoSender) {
-            // Use existing video track
             await videoSender.replaceTrack(screenTrack);
         } else {
-            // No video sender (Audio Only Mode was active)
-            // Add new track -> Triggers onnegotiationneeded -> renegotiates connection to include video
             peerConnection.current.addTrack(screenTrack, screenStream);
         }
       }
@@ -810,7 +836,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                             playsInline 
                             className="w-full h-full object-contain bg-black"
                         />
-                        {/* Fullscreen Button - Only show when connected and not in PiP mode (optional, but cleaner) */}
+                        {/* Fullscreen Button */}
                         <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity z-[60]">
                            <button 
                              onClick={toggleFullScreen}
@@ -977,16 +1003,43 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             </div>
             
             <div className="p-6 space-y-8 overflow-y-auto pb-safe flex-1 bg-gradient-to-b from-surface/50 to-black/20">
+                
+                {/* Frame Rate Section */}
+                <div>
+                    <h4 className="text-sm font-semibold text-slate-300 mb-3 flex items-center gap-2">
+                        <Film size={16} /> Frame Rate (FPS)
+                    </h4>
+                    <div className="grid grid-cols-2 gap-2">
+                        {(['30', '60'] as const).map((fps) => {
+                            const val = parseInt(fps) as FrameRate;
+                            return (
+                                <button
+                                    key={fps}
+                                    onClick={() => applyVideoQuality(videoQuality, val)}
+                                    className={`
+                                        px-3 py-2 rounded-xl border text-center transition-all
+                                        ${frameRate === val 
+                                            ? 'bg-primary/20 border-primary text-white' 
+                                            : 'bg-black/20 border-slate-700 text-slate-400 hover:bg-black/40'}
+                                    `}
+                                >
+                                    <div className="font-bold">{fps} FPS</div>
+                                </button>
+                            );
+                        })}
+                    </div>
+                </div>
+
                 {/* Video Quality Section */}
                 <div>
                     <h4 className="text-sm font-semibold text-slate-300 mb-3 flex items-center gap-2">
-                        <Activity size={16} /> Video Quality
+                        <Activity size={16} /> Resolution
                     </h4>
                     <div className="grid grid-cols-1 gap-2">
-                        {(['low', 'standard', 'hd'] as const).map((q) => (
+                        {(['low', 'standard', 'hd', 'fhd', '2k'] as const).map((q) => (
                             <button
                                 key={q}
-                                onClick={() => applyVideoQuality(q)}
+                                onClick={() => applyVideoQuality(q, frameRate)}
                                 className={`
                                     px-4 py-3 rounded-xl border text-left transition-all flex justify-between items-center
                                     ${videoQuality === q 
@@ -995,11 +1048,13 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
                                 `}
                             >
                                 <div>
-                                    <div className="font-medium capitalize">{q}</div>
+                                    <div className="font-medium capitalize">{q === 'fhd' ? 'Full HD (1080p)' : q === 'hd' ? 'HD (720p)' : q}</div>
                                     <div className="text-xs opacity-70 mt-0.5">
                                         {q === 'low' && '360p (Bandwidth saver)'}
                                         {q === 'standard' && '480p (Balanced)'}
-                                        {q === 'hd' && '720p (High Definition)'}
+                                        {q === 'hd' && '720p (Good)'}
+                                        {q === 'fhd' && '1080p (Great for Movies)'}
+                                        {q === '2k' && '1440p (Crystal Clear)'}
                                     </div>
                                 </div>
                                 {videoQuality === q && <Check size={16} className="text-primary" />}
