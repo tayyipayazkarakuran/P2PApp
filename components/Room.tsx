@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { 
-  Mic, MicOff, Monitor, PhoneOff, Video, VideoOff, 
-  Copy, Check, Link as LinkIcon, MessageSquare, Send, X, AlertCircle, RefreshCw, Settings, Signal, Activity, Layers, ArrowLeftRight
+  Mic, MicOff, PhoneOff, Video, VideoOff, 
+  Copy, Check, Link as LinkIcon, MessageSquare, Send, X, AlertCircle, RefreshCw, Settings, Signal, Activity, Layers, ArrowLeftRight, Maximize, Minimize, Monitor
 } from 'lucide-react';
 import { getSupabase } from '../services/supabaseClient';
 import { UserConfig, ChatMessage } from '../types';
@@ -50,6 +50,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputMessage, setInputMessage] = useState('');
   const [unreadCount, setUnreadCount] = useState(0);
+  const [isFullScreen, setIsFullScreen] = useState(false);
 
   // --- State: View Management ---
   // If true, Local Video is Big, Remote Video is Small (PiP)
@@ -68,6 +69,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const screenStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteContainerRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   
   // ICE Queue
@@ -97,6 +99,15 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
     }
   }, [isVideoOff, isScreenSharing]);
 
+  // Handle fullscreen change events (e.g. user pressing ESC)
+  useEffect(() => {
+    const handleFullScreenChange = () => {
+      setIsFullScreen(!!document.fullscreenElement);
+    };
+    document.addEventListener('fullscreenchange', handleFullScreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullScreenChange);
+  }, []);
+
   // --- Video Quality Helper ---
   const applyVideoQuality = async (quality: VideoQuality) => {
     setVideoQuality(quality);
@@ -122,6 +133,22 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         await videoTrack.applyConstraints(constraints);
     } catch (err) {
         console.warn("Could not apply video constraints:", err);
+    }
+  };
+
+  // --- Fullscreen Toggle ---
+  const toggleFullScreen = async (e: React.MouseEvent) => {
+    e.stopPropagation(); // Prevent swapping logic if button is clicked
+    if (!remoteContainerRef.current) return;
+
+    try {
+        if (!document.fullscreenElement) {
+            await remoteContainerRef.current.requestFullscreen();
+        } else {
+            await document.exitFullscreen();
+        }
+    } catch (err) {
+        console.error("Fullscreen error:", err);
     }
   };
 
@@ -348,7 +375,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             const pcState = peerConnection.current?.connectionState;
             const iceState = peerConnection.current?.iceConnectionState;
             
-            // Only restart if we are truly stuck (not connected)
+            // Only restart if we are in a stuck state (not connected)
             if (pcState !== 'connected' && iceState !== 'connected') {
                 console.log("Negotiation timed out. Retrying...");
                 restartConnection();
@@ -417,9 +444,19 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
         console.log("Track received", event.track.kind, event.streams[0]);
         if (event.streams && event.streams[0]) {
              if (remoteVideoRef.current) {
-                remoteVideoRef.current.srcObject = event.streams[0];
-                // Force play to ensure mobile/audio-only starts aren't blocked
-                remoteVideoRef.current.play().catch(e => console.log("Auto-play blocked/pending", e));
+                // CRITICAL: Prevent resetting srcObject if it's the same stream
+                // This prevents "The play() request was interrupted" AbortErrors
+                if (remoteVideoRef.current.srcObject !== event.streams[0]) {
+                    remoteVideoRef.current.srcObject = event.streams[0];
+                    // Force play to ensure mobile/audio-only starts aren't blocked
+                    remoteVideoRef.current.play().catch(e => {
+                        if (e.name === 'AbortError') {
+                            // Ignore abort errors caused by rapid stream updates
+                        } else {
+                            console.log("Auto-play blocked/pending", e);
+                        }
+                    });
+                }
              }
              setPeerConnected(true);
         }
@@ -705,16 +742,29 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
              
             {/* 1. REMOTE VIDEO */}
             <div 
+                ref={remoteContainerRef}
                 className={isSwapped ? pipClasses : fullscreenClasses}
                 onClick={() => isSwapped && setIsSwapped(false)}
             >
                 {peerConnected ? (
-                    <video 
-                        ref={remoteVideoRef} 
-                        autoPlay 
-                        playsInline 
-                        className="w-full h-full object-contain bg-black"
-                    />
+                    <>
+                        <video 
+                            ref={remoteVideoRef} 
+                            autoPlay 
+                            playsInline 
+                            className="w-full h-full object-contain bg-black"
+                        />
+                        {/* Fullscreen Button - Only show when connected and not in PiP mode (optional, but cleaner) */}
+                        <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity z-[60]">
+                           <button 
+                             onClick={toggleFullScreen}
+                             className="bg-black/50 hover:bg-black/70 p-2 rounded-full text-white backdrop-blur border border-white/10"
+                             title="Toggle Fullscreen"
+                           >
+                              {isFullScreen ? <Minimize size={20} /> : <Maximize size={20} />}
+                           </button>
+                        </div>
+                    </>
                 ) : (
                     !isSwapped && (
                         <div className="w-full h-full flex flex-col items-center justify-center text-slate-500 gap-6 animate-fade-in z-10 relative">
