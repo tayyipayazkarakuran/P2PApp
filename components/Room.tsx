@@ -271,22 +271,39 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       try {
         if (payload.type === 'announce') {
             const pcState = peerConnection.current.connectionState;
-            const sigState = peerConnection.current.signalingState;
+            
+            // F5/Refresh Handling:
+            // If we receive an 'announce', it means someone is joining or reconnecting (fresh start).
+            // Even if we think we are 'connected', this announce implies the other peer is NOT connected to us (they are new/refreshed).
+            // We must respect their need to connect.
+            
+            console.log("Announcement received from", payload.senderId);
 
-            // If we are already securely connected, ignore announcements completely
-            if (pcState === 'connected' || pcState === 'connecting') return;
-
-            // Determining Initiator
+            // Determining Initiator based on ID string comparison
             if (myId.current > payload.senderId) {
-                // I am the "Winner" (Initiator)
-                if (sigState !== 'stable' && pcState !== 'failed' && pcState !== 'disconnected') {
-                    return;
+                // I am the "Winner" (Initiator).
+                // Regardless of my current state, I must offer to the new peer.
+                // If I was connected to an old session, that session is dead now.
+                console.log("I am Initiator. Starting connection...");
+                
+                // If connected, we should restart to ensure a clean slate for the new peer
+                if (pcState === 'connected' || pcState === 'connecting') {
+                     console.log("Was connected, but peer refreshed. Restarting...");
+                     restartConnection();
+                     // restartConnection is async in effect, but we need to initiate after it sets up
+                     setTimeout(() => initiateConnection(), 100);
+                } else {
+                     initiateConnection();
                 }
-                console.log("Announcement received. I am Initiator. Calling peer...");
-                initiateConnection();
             } else {
-                // I am the "Follower"
-                console.log("Announcement received. I am Follower. Waiting for offer...");
+                // I am the "Follower".
+                console.log("I am Follower. Waiting for offer...");
+                // If I was connected, I should probably prepare to accept a new offer.
+                // Restarting ensures I don't mix old ICE candidates with new ones.
+                 if (pcState === 'connected' || pcState === 'connecting') {
+                     console.log("Was connected, but peer refreshed. Resetting to wait...");
+                     restartConnection();
+                }
             }
         } 
         else if (payload.type === 'offer') {
@@ -300,6 +317,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
           }
 
           if (peerConnection.current.signalingState !== 'stable') {
+             // Rollback if we were in the middle of something else to avoid state errors
              await Promise.all([
                 peerConnection.current.setLocalDescription({type: "rollback"}),
                 peerConnection.current.setRemoteDescription(new RTCSessionDescription(payload.sdp))
@@ -327,12 +345,25 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
             payload: { type: 'answer', sdp: answer, senderId: myId.current },
           });
 
+          // Check if we are already connected (physically) to fix UI stuck state
+          if (peerConnection.current.connectionState === 'connected') {
+              setStatus('Connected');
+              setStatusMessage('Securely connected');
+          }
+
         } else if (payload.type === 'answer') {
           console.log("Received Answer");
           setStatus('Negotiating');
           setStatusMessage('Finalizing connection...');
           if (peerConnection.current.signalingState === 'have-local-offer') {
               await peerConnection.current.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+          }
+          
+          // Fix for "Stuck in Negotiating": Check immediate status
+          if (peerConnection.current.connectionState === 'connected') {
+              setStatus('Connected');
+              setStatusMessage('Securely connected');
+              setPeerConnected(true);
           }
           
         } else if (payload.type === 'ice-candidate') {
@@ -351,6 +382,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       } catch (e) {
         console.error('Signaling error:', e);
         if (payload.type === 'offer' || payload.type === 'answer') {
+             console.log("Signaling error fatal, restarting...");
              restartConnection();
         }
       }
@@ -406,6 +438,12 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
 
   const restartConnection = () => {
       console.log("Restarting connection...");
+      // Stop announcement loop if running
+      if (announceInterval.current) {
+          clearInterval(announceInterval.current);
+          announceInterval.current = null;
+      }
+
       if (peerConnection.current) {
           peerConnection.current.close();
           peerConnection.current = null;
@@ -470,6 +508,15 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       
       peerConnection.current.oniceconnectionstatechange = () => {
           setDetailedStatus(prev => ({ ...prev, ice: peerConnection.current?.iceConnectionState || '-' }));
+          const iceState = peerConnection.current?.iceConnectionState;
+          if (iceState === 'connected' || iceState === 'completed') {
+             // Sometimes onconnectionstatechange doesn't fire for 'connected', so we trust ICE too
+             if (status !== 'Connected') {
+                 setStatus('Connected');
+                 setStatusMessage('Securely connected');
+                 setPeerConnected(true);
+             }
+          }
       };
       
       peerConnection.current.onsignalingstatechange = () => {
@@ -500,6 +547,7 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
   const startAnnouncementLoop = () => {
       if (announceInterval.current) clearInterval(announceInterval.current);
       
+      // Initial announce
       setTimeout(() => {
           if (peerConnection.current?.connectionState !== 'connected') {
              console.log("Broadcasting presence...");
@@ -512,8 +560,10 @@ export const Room: React.FC<RoomProps> = ({ roomId, config, onLeave }) => {
       }, 500);
 
       announceInterval.current = setInterval(() => {
+          // If we are connected, stop announcing
           if (peerConnection.current?.connectionState === 'connected') {
               clearInterval(announceInterval.current);
+              announceInterval.current = null;
               return;
           }
           
